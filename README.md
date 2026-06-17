@@ -19,12 +19,3 @@ SnipeBot 2.0 is an automated monitoring system designed to track and notify user
 * **Deployment-Ready:** Optimized for 24/7 cloud hosting via **Render.com** with integrated health-check endpoints for automated uptime monitoring via **UptimeRobot**.
 * **Configurable Environment:** Decoupled architecture utilizing secure `.env` management for platform-specific tokens and configuration settings.
 
----
-
-### Pro-Tip for your Discord README:
-
-Since you are now using the Health Check implementation, add a small "Status" badge to your README to show that it is always online:
-
-> **Status:** `![Status](https://img.shields.io/badge/Status-Online-brightgreen)` (You can link this to your Render URL).
-
-Does this description fit the vibe you want for your `SnipeBot 2.0`? If you need it to sound even more "hacker-focused" or "business-oriented," just let me know!
