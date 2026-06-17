@@ -17,21 +17,25 @@ import cron from "node-cron";
 import axios from "axios";
 import {
   searchVinted,
-  findCheaperAlternatives,
-  warmSession,
-  ensureSession,
-  setManualToken,
+  findCheaperAlternatives as findCheaperVinted,
   type VintedItem,
 } from "./vinted-scraper.js";
+import {
+  searchKleinanzeigen,
+  type KleinanzeigenItem,
+} from "./kleinanzeigen-scraper.js";
 import { logger } from "./lib/logger.js";
+
+// Unified item type for both platforms
+type DealItem = VintedItem | KleinanzeigenItem;
 
 const FALLBACK_CHANNEL_ID = "1483482170583678976";
 const DEFAULT_BRANDS = ["Nike", "Adidas", "Lacoste", "Ralph Lauren", "Carhartt"];
 
-const itemCache = new Map<string, VintedItem>();
+const itemCache = new Map<string, DealItem>();
 const MAX_CACHE_SIZE = 2000;
 
-function cacheItem(item: VintedItem) {
+function cacheItem(item: DealItem) {
   itemCache.set(item.id, item);
   if (itemCache.size > MAX_CACHE_SIZE) {
     const firstKey = itemCache.keys().next().value;
@@ -149,7 +153,7 @@ async function getFallbackChannel(client: Client): Promise<TextChannel | null> {
   return null;
 }
 
-function runFakeCheck(item: VintedItem): { embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> } {
+function runFakeCheck(item: DealItem): { embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> } {
   const warnings: string[] = [];
   const positives: string[] = [];
   let riskScore = 0;
@@ -210,10 +214,13 @@ function runFakeCheck(item: VintedItem): { embed: EmbedBuilder; row: ActionRowBu
   return { embed, row };
 }
 
-function buildDealEmbed(item: VintedItem): EmbedBuilder {
+function buildDealEmbed(item: DealItem): EmbedBuilder {
   const priceStr = `${item.price.toFixed(2)} ${item.currency}`;
+  const platformName = item.platform === "vinted" ? "Vinted" : "Kleinanzeigen";
+  const platformColor = item.platform === "vinted" ? 0x09b1ba : 0xff6b35;
+  
   const embed = new EmbedBuilder()
-    .setColor(0x09b1ba)
+    .setColor(platformColor)
     .setTitle(`${item.brand || "—"} | ${item.title}`.slice(0, 250))
     .setURL(item.url)
     .addFields(
@@ -222,15 +229,15 @@ function buildDealEmbed(item: VintedItem): EmbedBuilder {
       { name: "📐 Größe", value: item.size || "—", inline: true },
       { name: "✨ Zustand", value: item.condition || "—", inline: true },
       { name: "👤 Verkäufer", value: item.seller || "—", inline: true },
-      { name: "🔗 Plattform", value: "Vinted · DE", inline: true },
+      { name: "🔗 Plattform", value: `${platformName} · DE`, inline: true },
     )
-    .setFooter({ text: "Deal Bot • Vinted" })
+    .setFooter({ text: `Deal Bot • ${platformName}` })
     .setTimestamp();
   if (item.imageUrl) embed.setImage(item.imageUrl);
   return embed;
 }
 
-function buildDealButtons(item: VintedItem): ActionRowBuilder<ButtonBuilder>[] {
+function buildDealButtons(item: DealItem): ActionRowBuilder<ButtonBuilder>[] {
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setLabel("🛒 Ansehen").setStyle(ButtonStyle.Link).setURL(item.url),
     new ButtonBuilder().setLabel("💬 Anschreiben").setStyle(ButtonStyle.Link).setURL(`${item.url}#message`),
@@ -253,7 +260,8 @@ async function postDealsForGenderTarget(client: Client, categoryKeys: string[], 
   for (const categoryKey of categoryKeys) {
     const cat = CATEGORIES[categoryKey];
     if (!cat) continue;
-    await new Promise((r) => setTimeout(r, 1500));
+    logger.info(`🔍 Suche in Kategorie: ${cat.label} (${target.section})`);
+    await new Promise((r) => setTimeout(r, 500));
 
     const catalogIds = target.catalogIdsFn(categoryKey);
     if (catalogIds.length === 0) continue;
@@ -270,24 +278,41 @@ async function postDealsForGenderTarget(client: Client, categoryKeys: string[], 
     for (const brand of watchConfig.brands) {
       try {
         const searchText = buildSearchText(brand, categoryKey);
-        const items = await searchVinted(searchText, {
-          maxPrice: watchConfig.maxPrice,
-          catalogIds,
-        });
-        const newItems = items.filter((i) => !seenItemIds.has(i.id));
+        logger.info(`🔎 Suche: "${searchText}" (Max: ${watchConfig.maxPrice || 'unbegrenzt'}€)`);
+        
+        // Search both platforms in parallel
+        const [vintedItems, kleinanzeigenItems] = await Promise.all([
+          searchVinted(searchText, {
+            maxPrice: watchConfig.maxPrice,
+            catalogIds,
+          }),
+          searchKleinanzeigen(searchText, {
+            maxPrice: watchConfig.maxPrice,
+            category: categoryKey,
+          }),
+        ]);
+        
+        // Merge and sort by price (cheapest first)
+        const allItems = [...vintedItems, ...kleinanzeigenItems].sort((a, b) => a.price - b.price);
+        
+        logger.info(`✅ ${allItems.length} Items gefunden (${vintedItems.length} Vinted, ${kleinanzeigenItems.length} Kleinanzeigen)`);
+        const newItems = allItems.filter((i) => !seenItemIds.has(i.id));
+        logger.info(`📌 ${newItems.length} neue Items (${allItems.length - newItems.length} bereits gesehen)`);
 
+        // Post top 3 best deals (cheapest)
         for (const item of newItems.slice(0, 3)) {
           seenItemIds.add(item.id);
           cacheItem(item);
           const embed = buildDealEmbed(item);
           const rows = buildDealButtons(item);
           await channel.send({ embeds: [embed], components: rows });
-          await new Promise((r) => setTimeout(r, 800));
+          logger.info(`📤 Deal gepostet: ${item.platform.toUpperCase()} - ${item.brand} - ${item.price}€`);
+          await new Promise((r) => setTimeout(r, 300));
         }
       } catch (err) {
-        logger.error(`Fehler bei der Dealsuche für Marke ${brand} in ${categoryKey}: ` + String(err));
+        logger.error(`❌ Fehler bei der Dealsuche für Marke ${brand} in ${categoryKey}: ` + String(err));
       }
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 800));
     }
   }
 }
@@ -340,12 +365,7 @@ async function notifyBlocked(client: Client) {
 async function postDeals(client: Client) {
   if (!watchConfig.active) return;
 
-  const sessionOk = await warmSession();
-  if (!sessionOk) {
-    logger.warn("Überspringe Suchzyklus — Vinted-Session blockiert oder nicht erreichbar");
-    await notifyBlocked(client);
-    return;
-  }
+  logger.info("🚀 Starte Deal-Suche auf Vinted & Kleinanzeigen");
 
   const categoryKeys = watchConfig.categoryKey === "alle" ? ALL_CATEGORY_KEYS : [watchConfig.categoryKey];
   const targets: GenderTarget[] = [];
@@ -360,6 +380,8 @@ async function postDeals(client: Client) {
   for (const target of targets) {
     await postDealsForGenderTarget(client, categoryKeys, target);
   }
+  
+  logger.info("✅ Deal-Suche abgeschlossen");
 }
 
 const commands = [
@@ -441,42 +463,17 @@ export async function startBot() {
       logger.error("Registrierung der Slash-Commands fehlgeschlagen: " + String(err));
     }
 
-    cron.schedule("*/5 * * * *", () => {
+    cron.schedule("*/2 * * * *", () => {
+      logger.info("🔄 Starte automatische Deal-Suche (alle 2 Minuten)");
       postDeals(client).catch((err) => logger.error("Cron Dealcheck fehlgeschlagen: " + String(err)));
     });
 
-    cron.schedule("*/20 * * * *", () => {
-      ensureSession()
-        .then((ok) => logger.info(`Proaktiver Session-Refresh Status: ${ok}`))
-        .catch((err) => logger.warn("Proaktiver Session-Refresh fehlgeschlagen: " + String(err)));
-    });
+
 
     await postDeals(client);
   });
 
-  client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot) return;
-    if (message.channel.type !== 1) return; // Nur DMs
-    if (botOwnerId && message.author.id !== botOwnerId) {
-      await message.reply("❌ Du bist nicht berechtigt, den Token zu setzen.");
-      return;
-    }
 
-    const content = message.content.trim();
-    if (content.length > 30 && !content.includes(" ")) {
-      setManualToken(content);
-      await message.reply(
-        "✅ **Token gesetzt!** Der Bot startet jetzt sofort die Deal-Suche.\n" +
-        "Der Token gilt ca. **12 Stunden**."
-      );
-      setTimeout(() => postDeals(client).catch(() => {}), 1000);
-    } else {
-      await message.reply(
-        "❓ Das sieht nicht wie ein gültiger Token aus.\n\n" +
-        "Schick mir nur den reinen `access_token_web` Wert aus den Vinted-Cookies."
-      );
-    }
-  });
 
   client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
@@ -534,13 +531,10 @@ export async function startBot() {
           return;
         }
 
-        const sessionOk = await ensureSession();
-        if (!sessionOk) {
-          await interaction.editReply("⚠️ Vinted-Session gerade nicht verfügbar. Bitte in 1-2 Minuten nochmal versuchen.");
-          return;
-        }
-
-        const alternatives = await findCheaperAlternatives(item);
+        // Only Vinted items support findCheaperAlternatives for now
+        const alternatives = item.platform === "vinted" 
+          ? await findCheaperVinted(item as VintedItem)
+          : [];
 
         const mainEmbed = new EmbedBuilder()
           .setColor(0x09b1ba)
@@ -623,9 +617,9 @@ export async function startBot() {
           .setTimestamp();
         if (item.imageUrl) savedEmbed.setImage(item.imageUrl);
 
+        const platformName = item.platform === "vinted" ? "Vinted" : "Kleinanzeigen";
         const linkRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setLabel("🛒 Auf Vinted ansehen").setStyle(ButtonStyle.Link).setURL(item.url),
-          new ButtonBuilder().setLabel("💬 Verkäufer anschreiben").setStyle(ButtonStyle.Link).setURL(`${item.url}#message`),
+          new ButtonBuilder().setLabel(`🛒 Auf ${platformName} ansehen`).setStyle(ButtonStyle.Link).setURL(item.url),
         );
 
         try {
@@ -729,10 +723,7 @@ export async function startBot() {
           await cmd.reply("🗑️ Cache geleert. Bei nächster Suche werden alle Items wieder als 'neu' behandelt.");
 
         } else if (sub === "token") {
-          const tokenValue = cmd.options.getString("wert", true).trim();
-          setManualToken(tokenValue);
-          await cmd.reply({ content: "✅ Vinted Token gesetzt und gespeichert! Der Bot sucht nun sofort.", ephemeral: true });
-          setTimeout(() => postDeals(client).catch(() => {}), 1000);
+          await cmd.reply({ content: "ℹ️ Token-Management wurde entfernt. Der Bot nutzt jetzt tokenlose API-Anfragen.", ephemeral: true });
         }
 
       } else if (cmd.commandName === "lizenz") {
