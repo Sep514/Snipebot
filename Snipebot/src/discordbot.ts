@@ -17,21 +17,25 @@ import cron from "node-cron";
 import axios from "axios";
 import {
   searchVinted,
-  findCheaperAlternatives,
-  warmSession,
-  ensureSession,
-  setManualToken,
+  findCheaperAlternatives as findCheaperVinted,
   type VintedItem,
 } from "./vinted-scraper.js";
+import {
+  searchKleinanzeigen,
+  type KleinanzeigenItem,
+} from "./kleinanzeigen-scraper.js";
 import { logger } from "./lib/logger.js";
+
+// Unified item type for both platforms
+type DealItem = VintedItem | KleinanzeigenItem;
 
 const FALLBACK_CHANNEL_ID = "1483482170583678976";
 const DEFAULT_BRANDS = ["Nike", "Adidas", "Lacoste", "Ralph Lauren", "Carhartt"];
 
-const itemCache = new Map<string, VintedItem>();
+const itemCache = new Map<string, DealItem>();
 const MAX_CACHE_SIZE = 2000;
 
-function cacheItem(item: VintedItem) {
+function cacheItem(item: DealItem) {
   itemCache.set(item.id, item);
   if (itemCache.size > MAX_CACHE_SIZE) {
     const firstKey = itemCache.keys().next().value;
@@ -68,29 +72,23 @@ interface CategoryDef {
   label: string;
   keyword: string;
   channelName: string;
-  herrenCatalogIds: number[];
-  damenCatalogIds: number[];
+  kleinanzeigenCategory: string;
 }
 
 const CATEGORIES: Record<string, CategoryDef> = {
-  pullover: { label: "Pullover & Strickjacken", keyword: "Pullover", channelName: "pullover-strickjacken", herrenCatalogIds: [79], damenCatalogIds: [80] },
-  hoodie: { label: "Hoodies & Sweatshirts", keyword: "Hoodie", channelName: "hoodies-sweatshirts", herrenCatalogIds: [267], damenCatalogIds: [266] },
-  tshirt: { label: "T-Shirts", keyword: "T-Shirt", channelName: "t-shirts", herrenCatalogIds: [76], damenCatalogIds: [77] },
-  hemd: { label: "Hemden", keyword: "Hemd", channelName: "hemden", herrenCatalogIds: [536], damenCatalogIds: [] },
-  jacke: { label: "Jacken & Mäntel", keyword: "Jacke", channelName: "jacken-mäntel", herrenCatalogIds: [1206], damenCatalogIds: [1037] },
-  hose: { label: "Hosen", keyword: "Hose", channelName: "hosen", herrenCatalogIds: [34], damenCatalogIds: [33] },
-  jeans: { label: "Jeans", keyword: "Jeans", channelName: "jeans", herrenCatalogIds: [257], damenCatalogIds: [10] },
-  shorts: { label: "Shorts", keyword: "Shorts", channelName: "shorts", herrenCatalogIds: [82], damenCatalogIds: [11] },
-  schuhe: { label: "Schuhe", keyword: "Schuhe", channelName: "schuhe", herrenCatalogIds: [1242], damenCatalogIds: [16] },
-  trainingsanzug: { label: "Trainingsanzug", keyword: "Trainingsanzug", channelName: "trainingsanzug", herrenCatalogIds: [2050], damenCatalogIds: [2994] },
-  muetze: { label: "Mützen & Caps", keyword: "Mütze", channelName: "mützen-caps", herrenCatalogIds: [89], damenCatalogIds: [88] },
+  shirts: { label: "Shirts & Tops", keyword: "shirt", channelName: "men_shirts", kleinanzeigenCategory: "87" },
+  pants: { label: "Hosen & Jeans", keyword: "hose", channelName: "men_pants", kleinanzeigenCategory: "87" },
+  shoes: { label: "Schuhe", keyword: "schuhe", channelName: "men_shoes", kleinanzeigenCategory: "158" },
+  accessories: { label: "Accessoires", keyword: "", channelName: "deals", kleinanzeigenCategory: "87" },
 };
 
 const ALL_CATEGORY_KEYS = Object.keys(CATEGORIES);
 
 const CATEGORY_CHOICES = [
-  { name: "Alle Kategorien", value: "alle" },
-  ...Object.entries(CATEGORIES).map(([value, def]) => ({ name: def.label, value })),
+  { name: "Shirts & Tops", value: "shirts" },
+  { name: "Hosen & Jeans", value: "pants" },
+  { name: "Schuhe", value: "shoes" },
+  { name: "Accessoires", value: "accessories" },
 ];
 
 interface WatchConfig {
@@ -105,11 +103,13 @@ const watchConfig: WatchConfig = {
   brands: [...DEFAULT_BRANDS],
   maxPrice: undefined,
   active: true,
-  categoryKey: "alle",
+  categoryKey: "accessories",
   gender: "beide",
 };
 
 const seenItemIds = new Set<string>();
+let rateLimitedUntil = 0;
+let consecutiveRateLimits = 0;
 
 function genderLabel(g: Gender): string {
   if (g === "herren") return "Herren";
@@ -149,7 +149,7 @@ async function getFallbackChannel(client: Client): Promise<TextChannel | null> {
   return null;
 }
 
-function runFakeCheck(item: VintedItem): { embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> } {
+function runFakeCheck(item: DealItem): { embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> } {
   const warnings: string[] = [];
   const positives: string[] = [];
   let riskScore = 0;
@@ -210,38 +210,33 @@ function runFakeCheck(item: VintedItem): { embed: EmbedBuilder; row: ActionRowBu
   return { embed, row };
 }
 
-function buildDealEmbed(item: VintedItem): EmbedBuilder {
+function buildDealEmbed(item: DealItem): EmbedBuilder {
   const priceStr = `${item.price.toFixed(2)} ${item.currency}`;
+  const platformName = item.platform === "vinted" ? "Vinted" : "Kleinanzeigen";
+  
   const embed = new EmbedBuilder()
-    .setColor(0x09b1ba)
-    .setTitle(`${item.brand || "—"} | ${item.title}`.slice(0, 250))
+    .setColor(0x6EB6FF)
+    .setTitle(`${item.title}`.slice(0, 250))
     .setURL(item.url)
     .addFields(
       { name: "💰 Preis", value: priceStr, inline: true },
       { name: "🏷️ Marke", value: item.brand || "—", inline: true },
       { name: "📐 Größe", value: item.size || "—", inline: true },
-      { name: "✨ Zustand", value: item.condition || "—", inline: true },
-      { name: "👤 Verkäufer", value: item.seller || "—", inline: true },
-      { name: "🔗 Plattform", value: "Vinted · DE", inline: true },
     )
-    .setFooter({ text: "Deal Bot • Vinted" })
+    .setFooter({ text: `${platformName} • Snipebot` })
     .setTimestamp();
   if (item.imageUrl) embed.setImage(item.imageUrl);
   return embed;
 }
 
-function buildDealButtons(item: VintedItem): ActionRowBuilder<ButtonBuilder>[] {
-  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setLabel("🛒 Ansehen").setStyle(ButtonStyle.Link).setURL(item.url),
-    new ButtonBuilder().setLabel("💬 Anschreiben").setStyle(ButtonStyle.Link).setURL(`${item.url}#message`),
+function buildDealButtons(item: DealItem): ActionRowBuilder<ButtonBuilder>[] {
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`save_${item.id}`).setLabel("❤️ Merken").setStyle(ButtonStyle.Danger),
-  );
-  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`interested_${item.id}`).setLabel("👍 Interessiert").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`fakecheck_${item.id}`).setLabel("🔍 Fake-Check").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`pricecheck_${item.id}`).setLabel("💰 Pricecheck").setStyle(ButtonStyle.Success),
   );
-  return [row1, row2];
+  return [row];
 }
 
 interface GenderTarget {
@@ -253,41 +248,59 @@ async function postDealsForGenderTarget(client: Client, categoryKeys: string[], 
   for (const categoryKey of categoryKeys) {
     const cat = CATEGORIES[categoryKey];
     if (!cat) continue;
-    await new Promise((r) => setTimeout(r, 1500));
+    logger.info(`🔍 Suche in Kategorie: ${cat.label}`);
+    await new Promise((r) => setTimeout(r, 500));
 
-    const catalogIds = target.catalogIdsFn(categoryKey);
-    if (catalogIds.length === 0) continue;
-
-    const channel =
-      (await findChannelInSection(client, cat.channelName, target.section)) ??
-      (await getFallbackChannel(client));
+    const channel = (await findChannelByName(client, cat.channelName)) ?? (await getFallbackChannel(client));
 
     if (!channel) {
-      logger.warn(`Kanal #${cat.channelName} im Bereich ${target.section} nicht gefunden.`);
+      logger.warn(`Kanal #${cat.channelName} nicht gefunden.`);
       continue;
     }
 
     for (const brand of watchConfig.brands) {
       try {
-        const searchText = buildSearchText(brand, categoryKey);
-        const items = await searchVinted(searchText, {
-          maxPrice: watchConfig.maxPrice,
-          catalogIds,
-        });
-        const newItems = items.filter((i) => !seenItemIds.has(i.id));
+        // Build search text with category keyword
+        const searchText = cat.keyword ? `${brand} ${cat.keyword}` : brand;
+        logger.info(`🔎 Suche: "${searchText}" in #${cat.channelName} (Max: ${watchConfig.maxPrice || 'unbegrenzt'}€)`);
+        
+        // Search both platforms in parallel
+        const [vintedItems, kleinanzeigenItems] = await Promise.all([
+          searchVinted(searchText, {
+            maxPrice: watchConfig.maxPrice,
+          }),
+          searchKleinanzeigen(searchText, {
+            maxPrice: watchConfig.maxPrice,
+            category: categoryKey,
+          }),
+        ]);
+        
+        // Reset counter if we got any results
+        if (vintedItems.length > 0 || kleinanzeigenItems.length > 0) {
+          consecutiveRateLimits = 0;
+        }
+        
+        // Merge and sort by price (cheapest first)
+        const allItems = [...vintedItems, ...kleinanzeigenItems].sort((a, b) => a.price - b.price);
+        
+        logger.info(`✅ ${allItems.length} Items gefunden (${vintedItems.length} Vinted, ${kleinanzeigenItems.length} Kleinanzeigen)`);
+        const newItems = allItems.filter((i) => !seenItemIds.has(i.id));
+        logger.info(`📌 ${newItems.length} neue Items (${allItems.length - newItems.length} bereits gesehen)`);
 
+        // Post top 3 best deals (cheapest)
         for (const item of newItems.slice(0, 3)) {
           seenItemIds.add(item.id);
           cacheItem(item);
           const embed = buildDealEmbed(item);
           const rows = buildDealButtons(item);
           await channel.send({ embeds: [embed], components: rows });
-          await new Promise((r) => setTimeout(r, 800));
+          logger.info(`📤 Deal gepostet: ${item.platform.toUpperCase()} - ${item.brand} - ${item.price}€`);
+          await new Promise((r) => setTimeout(r, 300));
         }
       } catch (err) {
-        logger.error(`Fehler bei der Dealsuche für Marke ${brand} in ${categoryKey}: ` + String(err));
+        logger.error(`❌ Fehler bei der Dealsuche für Marke ${brand} in ${categoryKey}: ` + String(err));
       }
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 3000));
     }
   }
 }
@@ -340,26 +353,22 @@ async function notifyBlocked(client: Client) {
 async function postDeals(client: Client) {
   if (!watchConfig.active) return;
 
-  const sessionOk = await warmSession();
-  if (!sessionOk) {
-    logger.warn("Überspringe Suchzyklus — Vinted-Session blockiert oder nicht erreichbar");
-    await notifyBlocked(client);
+  // Check if we're rate limited
+  if (Date.now() < rateLimitedUntil) {
+    const waitMinutes = Math.ceil((rateLimitedUntil - Date.now()) / 60000);
+    logger.warn(`⏸️ Rate-Limit aktiv - warte noch ${waitMinutes} Minuten`);
     return;
   }
 
-  const categoryKeys = watchConfig.categoryKey === "alle" ? ALL_CATEGORY_KEYS : [watchConfig.categoryKey];
-  const targets: GenderTarget[] = [];
+  logger.info("🚀 Starte Deal-Suche auf Kleinanzeigen");
 
-  if (watchConfig.gender === "herren" || watchConfig.gender === "beide") {
-    targets.push({ section: "men", catalogIdsFn: (key) => CATEGORIES[key]?.herrenCatalogIds ?? [] });
-  }
-  if (watchConfig.gender === "damen" || watchConfig.gender === "beide") {
-    targets.push({ section: "woman", catalogIdsFn: (key) => CATEGORIES[key]?.damenCatalogIds ?? [] });
-  }
+  // Search all categories
+  const categoryKeys = ALL_CATEGORY_KEYS;
+  const target: GenderTarget = { section: "men", catalogIdsFn: () => [] };
 
-  for (const target of targets) {
-    await postDealsForGenderTarget(client, categoryKeys, target);
-  }
+  await postDealsForGenderTarget(client, categoryKeys, target);
+  
+  logger.info("✅ Deal-Suche abgeschlossen");
 }
 
 const commands = [
@@ -442,41 +451,16 @@ export async function startBot() {
     }
 
     cron.schedule("*/5 * * * *", () => {
+      logger.info("🔄 Starte automatische Deal-Suche (alle 5 Minuten)");
       postDeals(client).catch((err) => logger.error("Cron Dealcheck fehlgeschlagen: " + String(err)));
     });
 
-    cron.schedule("*/20 * * * *", () => {
-      ensureSession()
-        .then((ok) => logger.info(`Proaktiver Session-Refresh Status: ${ok}`))
-        .catch((err) => logger.warn("Proaktiver Session-Refresh fehlgeschlagen: " + String(err)));
-    });
+
 
     await postDeals(client);
   });
 
-  client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot) return;
-    if (message.channel.type !== 1) return; // Nur DMs
-    if (botOwnerId && message.author.id !== botOwnerId) {
-      await message.reply("❌ Du bist nicht berechtigt, den Token zu setzen.");
-      return;
-    }
 
-    const content = message.content.trim();
-    if (content.length > 30 && !content.includes(" ")) {
-      setManualToken(content);
-      await message.reply(
-        "✅ **Token gesetzt!** Der Bot startet jetzt sofort die Deal-Suche.\n" +
-        "Der Token gilt ca. **12 Stunden**."
-      );
-      setTimeout(() => postDeals(client).catch(() => {}), 1000);
-    } else {
-      await message.reply(
-        "❓ Das sieht nicht wie ein gültiger Token aus.\n\n" +
-        "Schick mir nur den reinen `access_token_web` Wert aus den Vinted-Cookies."
-      );
-    }
-  });
 
   client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
@@ -534,13 +518,10 @@ export async function startBot() {
           return;
         }
 
-        const sessionOk = await ensureSession();
-        if (!sessionOk) {
-          await interaction.editReply("⚠️ Vinted-Session gerade nicht verfügbar. Bitte in 1-2 Minuten nochmal versuchen.");
-          return;
-        }
-
-        const alternatives = await findCheaperAlternatives(item);
+        // Only Vinted items support findCheaperAlternatives for now
+        const alternatives = item.platform === "vinted" 
+          ? await findCheaperVinted(item as VintedItem)
+          : [];
 
         const mainEmbed = new EmbedBuilder()
           .setColor(0x09b1ba)
@@ -623,9 +604,9 @@ export async function startBot() {
           .setTimestamp();
         if (item.imageUrl) savedEmbed.setImage(item.imageUrl);
 
+        const platformName = item.platform === "vinted" ? "Vinted" : "Kleinanzeigen";
         const linkRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setLabel("🛒 Auf Vinted ansehen").setStyle(ButtonStyle.Link).setURL(item.url),
-          new ButtonBuilder().setLabel("💬 Verkäufer anschreiben").setStyle(ButtonStyle.Link).setURL(`${item.url}#message`),
+          new ButtonBuilder().setLabel(`🛒 Auf ${platformName} ansehen`).setStyle(ButtonStyle.Link).setURL(item.url),
         );
 
         try {
@@ -677,17 +658,14 @@ export async function startBot() {
           await cmd.reply("⏹️ Deal-Suche gestoppt.");
 
         } else if (sub === "status") {
-          const catLabel = watchConfig.categoryKey === "alle"
-            ? "Alle Kategorien (jede in eigenem Kanal)"
-            : CATEGORIES[watchConfig.categoryKey]?.label ?? "Unbekannt";
           await cmd.reply(
             `📊 **Status**\n` +
             `• Aktiv: ${watchConfig.active ? "✅ Ja" : "❌ Nein"}\n` +
             `• Marken: ${watchConfig.brands.join(", ")}\n` +
-            `• Kategorie: **${catLabel}**\n` +
             `• Geschlecht: **${genderLabel(watchConfig.gender)}**\n` +
             `• Max. Preis: ${watchConfig.maxPrice ? `${watchConfig.maxPrice} EUR` : "kein Limit"}\n` +
-            `• Items im Cache: ${seenItemIds.size} (${itemCache.size} im Speicher)`,
+            `• Items im Cache: ${seenItemIds.size} (${itemCache.size} im Speicher)\n` +
+            `• Kanal: #deals`,
           );
 
         } else if (sub === "marken") {
@@ -729,10 +707,7 @@ export async function startBot() {
           await cmd.reply("🗑️ Cache geleert. Bei nächster Suche werden alle Items wieder als 'neu' behandelt.");
 
         } else if (sub === "token") {
-          const tokenValue = cmd.options.getString("wert", true).trim();
-          setManualToken(tokenValue);
-          await cmd.reply({ content: "✅ Vinted Token gesetzt und gespeichert! Der Bot sucht nun sofort.", ephemeral: true });
-          setTimeout(() => postDeals(client).catch(() => {}), 1000);
+          await cmd.reply({ content: "ℹ️ Token-Management wurde entfernt. Der Bot nutzt jetzt tokenlose API-Anfragen.", ephemeral: true });
         }
 
       } else if (cmd.commandName === "lizenz") {
