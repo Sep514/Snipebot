@@ -72,6 +72,68 @@ function extractBrand(title: string, searchQuery: string): string {
   return searchQuery.split(" ")[0] || "—";
 }
 
+function extractSize(title: string): string {
+  // Match common size formats: M, L, XL, XXL, 42, 44, 46, etc.
+  const sizePatterns = [
+    /\b(XXS|XS|S|M|L|XL|XXL|XXXL)\b/i,
+    /\b(3XL|4XL|5XL)\b/i,
+    /\bGr\.?\s*(\d{2})\b/i,
+    /\bGröße\s*(\d{2})\b/i,
+    /\b(\d{2})\s*\/\s*\d{2}\b/,
+    /\b(\d{2})\b(?=\s|$)/,
+  ];
+  
+  for (const pattern of sizePatterns) {
+    const match = title.match(pattern);
+    if (match) {
+      return match[1] || match[0];
+    }
+  }
+  
+  return "—";
+}
+
+function isValidMensSize(size: string): boolean {
+  if (size === "—") return true; // Allow unknown sizes
+  
+  const sizeUpper = size.toUpperCase();
+  
+  // Valid letter sizes for men
+  const validLetterSizes = ["S", "M", "L", "XL", "XXL", "XXXL", "3XL", "4XL"];
+  if (validLetterSizes.includes(sizeUpper)) return true;
+  
+  // Valid numeric sizes (42-48 for men)
+  const numericSize = parseInt(size);
+  if (!isNaN(numericSize) && numericSize >= 42 && numericSize <= 48) return true;
+  
+  return false;
+}
+
+function isQualityDeal(item: KleinanzeigenItem, searchText: string): boolean {
+  const titleLower = item.title.toLowerCase();
+  
+  // Filter out kids items
+  const kidsKeywords = ["kinder", "baby", "junge", "mädchen", "kids", "junior"];
+  if (kidsKeywords.some(k => titleLower.includes(k))) return false;
+  
+  // Filter out damaged/defect items
+  const defectKeywords = ["defekt", "kaputt", "beschädigt", "riss", "loch", "fleck"];
+  if (defectKeywords.some(k => titleLower.includes(k))) return false;
+  
+  // Must have valid brand
+  const brands = ["nike", "adidas", "lacoste", "ralph lauren", "carhartt", "puma", "tommy hilfiger"];
+  const hasBrand = brands.some(b => titleLower.includes(b));
+  if (!hasBrand) return false;
+  
+  // Check size validity for clothing
+  if (!isValidMensSize(item.size)) return false;
+  
+  // Price must be reasonable (not free, not suspiciously cheap)
+  if (item.price < 1 || item.price > 200) return false;
+  
+  return true;
+}
+
 export async function searchKleinanzeigen(
   searchText: string,
   options: SearchOptions = {},
@@ -134,25 +196,39 @@ export async function searchKleinanzeigen(
         const relativeUrl = $item.find("a.ellipsis").attr("href") || "";
         const url = relativeUrl.startsWith("http") ? relativeUrl : `${KLEINANZEIGEN_BASE}${relativeUrl}`;
         
-        const imageUrl = $item.find("img.galleryimage-element").attr("src") || "";
+        // Extract image URL - try multiple selectors
+        let imageUrl = $item.find("img.galleryimage-element").attr("src") || "";
+        if (!imageUrl) {
+          imageUrl = $item.find("img").first().attr("src") || "";
+        }
+        // Ensure full URL
+        if (imageUrl && !imageUrl.startsWith("http")) {
+          imageUrl = imageUrl.startsWith("//") ? `https:${imageUrl}` : `${KLEINANZEIGEN_BASE}${imageUrl}`;
+        }
+        
         const location = $item.find(".aditem-main--top--left").text().trim();
-        
         const brand = extractBrand(title, searchText);
+        const size = extractSize(title);
         
-        items.push({
+        const item: KleinanzeigenItem = {
           id,
           title,
           price,
           currency: "EUR",
           brand,
-          size: "—",
+          size,
           condition: "—",
           imageUrl,
           url,
           seller: "—",
           location: location || "—",
           platform: "kleinanzeigen",
-        });
+        };
+        
+        // Only add quality deals
+        if (isQualityDeal(item, searchText)) {
+          items.push(item);
+        }
       } catch (err) {
         logger.warn("Fehler beim Parsen eines Kleinanzeigen-Items:", err);
       }
